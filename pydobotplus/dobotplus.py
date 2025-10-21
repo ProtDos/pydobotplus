@@ -1,3 +1,4 @@
+from logging import DEBUG
 import pydobotplus
 import math
 import struct
@@ -268,7 +269,6 @@ class Dobot:
         return msg
         
         
-
     def _send_message(self, msg) -> None:
 
         self.logger.debug('pydobot: >>', msg)
@@ -302,6 +302,30 @@ class Dobot:
                 self.logger.debug('pydobot: <<', ":".join('{:02x}'.format(x) for x in b))
                 return msg
         return None
+
+    def get_device_serial_number(self) -> str:
+        msg = Message()
+        msg.id = 0
+        response = self._send_command(msg)
+
+        return response.params.rstrip(b'\x00').decode('ascii')
+
+    def get_device_name(self):
+        msg = Message()
+        msg.id = 1
+        response = self._send_command(msg)
+
+        return response.params.rstrip(b'\x00').decode('ascii')
+
+    def set_device_name(self, device_name: str):
+        msg = Message()
+        msg.id = 1
+        msg.ctrl = 0x01
+        msg.params = bytearray(device_name.encode("ascii"))
+        msg.params.extend([0x00])
+
+        return self._send_command(msg)
+
 
     def get_pose(self) -> Pose:
         msg = Message()
