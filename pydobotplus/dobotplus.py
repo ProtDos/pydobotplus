@@ -204,7 +204,10 @@ class Dobot:
 
     def __init__(self, port: Optional[str] = None) -> None:
 
-        self.logger = logging.Logger(__name__)
+        # getLogger (not Logger) so this logger propagates to the root handler
+        # configured by basicConfig — without this, ALL warnings from _rt_loop
+        # are silently swallowed because a bare Logger() has no output handlers.
+        self.logger = logging.getLogger(__name__)
         self._lock = RLock()
 
         if port is None:
@@ -448,21 +451,21 @@ class Dobot:
         Args:
             x, y, z:     Target position (absolute) or offset (incremental) in mm.
             velocity:    Target velocity for this segment (mm/s).
-                         In real-time mode this is the speed the arm aims to reach
-                         while travelling to (x, y, z).
-            incremental: False = absolute Cartesian coordinates (default, use this
-                                 for real-time slider tracking).
-                         True  = relative offsets from current position (used by
-                                 engrave()).
+            incremental: False = absolute Cartesian coordinates (default).
+                         True  = relative offsets from current position.
+
+        cpMode byte: 0x01 = absolute, 0x00 = incremental.
+        This matches _set_cple_cmd where absolute=True → int(True) = 1 = 0x01.
+        The original hardcoded _set_cp_cmd also used 0x01 for all moves.
         """
         msg = Message()
         msg.id = 91
         msg.ctrl = 0x03
-        msg.params = bytearray([0x01 if incremental else 0x00])  # cpMode
+        msg.params = bytearray([0x00 if incremental else 0x01])  # 0x01=absolute, 0x00=incremental
         msg.params.extend(struct.pack('f', x))
         msg.params.extend(struct.pack('f', y))
         msg.params.extend(struct.pack('f', z))
-        msg.params.extend(struct.pack('f', velocity))            # was: append(0x00) — fixed!
+        msg.params.extend(struct.pack('f', velocity))
         return self._send_command(msg)
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -622,10 +625,11 @@ class Dobot:
 
             # ── xyz via CP real-time ──────────────────────────────────────
             try:
-                resp         = self._set_cp_cmd(x, y, z, velocity, incremental=False)
+                resp          = self._set_cp_cmd(x, y, z, velocity, incremental=False)
                 last_sent_idx = self._extract_cmd_index(resp)
             except DobotException as exc:
                 self.logger.warning(f"RT CP command failed: {exc}")
+                print(f"[RT] CP command failed: {exc}", flush=True)
 
             # ── r via PTP (gated) ─────────────────────────────────────────
             # Mixing a PTP command into the CP stream breaks look-ahead for
