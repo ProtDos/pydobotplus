@@ -579,74 +579,54 @@ class Dobot:
         self._set_queued_cmd_start_exec()
 
     def _rt_loop(self) -> None:
-        """Background thread: sends CP commands at period_ms intervals.
-
-        xyz follow the CP real-time stream.
-
-        r is handled separately via a queued PTP command because CP does
-        not carry an r field.  The r update is gated by a 1° deadband and
-        a minimum inter-update interval so it never floods the queue or
-        breaks CP look-ahead more than necessary.
         """
-        R_DEADBAND_DEG   = 1.0   # only update r when it drifts more than this
-        R_MIN_INTERVAL_S = 0.30  # no more than one r correction per 300 ms
-        QUEUE_GUARD_EVERY_S = 0.5  # check queue depth this often
-        MAX_QUEUE_AHEAD  = 6     # if the queue is deeper than this, we're flooding
+        Sends CP commands only when the target changes (deduplication) plus a
+        keep-alive every 500 ms so the arm holds position when sliders are idle.
 
-        last_r_sent        = self._rt_target[3]
-        last_r_update_time = 0.0
-        last_queue_check   = 0.0
-        last_sent_idx      = 0
+        This prevents the queue from filling with hundreds of identical waypoints
+        when no slider is moving. With deduplication the queue depth stays at 1-2
+        regardless of how frequently update_target() is called.
+        """
+        KEEP_ALIVE_S = 0.5  # re-send position-hold at least this often
+        R_DEADBAND_DEG = 1.0  # only correct R if it drifted more than this
+        R_MIN_INTERVAL = 0.30  # seconds between R PTP corrections
+
+        last_xyz_key = None  # dedup: (x, y, z, velocity) rounded to 0.1 mm
+        last_r_sent = self._rt_target[3]
+        last_r_time = 0.0
+        last_send_time = 0.0
 
         while not self._rt_stop_event.is_set():
             tick = time.monotonic()
 
-            # ── periodic queue-depth guard ────────────────────────────────
-            # Checking every 500 ms costs only one serial roundtrip per second,
-            # which is negligible.  It protects against runaway queue growth if
-            # Python scheduling delays cause us to call _set_cp_cmd faster than
-            # the controller can consume commands.
-            if tick - last_queue_check > QUEUE_GUARD_EVERY_S:
-                last_queue_check = tick
-                current_idx = self._get_queued_cmd_current_index()
-                ahead = last_sent_idx - current_idx
-                if ahead > MAX_QUEUE_AHEAD:
-                    self.logger.warning(
-                        f"RT loop: queue {ahead} commands ahead (max {MAX_QUEUE_AHEAD}). "
-                        "Pausing one period to let the controller catch up."
-                    )
-                    time.sleep(self._rt_period)
-                    continue
-
-            # ── read current target (atomic snapshot) ────────────────────
             with self._rt_lock:
                 x, y, z, r = self._rt_target[:]
-                velocity    = self._rt_velocity
+                velocity = self._rt_velocity
 
-            # ── xyz via CP real-time ──────────────────────────────────────
-            try:
-                resp          = self._set_cp_cmd(x, y, z, velocity, incremental=False)
-                last_sent_idx = self._extract_cmd_index(resp)
-            except DobotException as exc:
-                self.logger.warning(f"RT CP command failed: {exc}")
-                print(f"[RT] CP command failed: {exc}", flush=True)
+            xyz_key = (round(x, 1), round(y, 1), round(z, 1), round(velocity, 1))
 
-            # ── r via PTP (gated) ─────────────────────────────────────────
-            # Mixing a PTP command into the CP stream breaks look-ahead for
-            # that one cycle, causing a tiny position stutter.  The deadband
-            # and time gate keep this infrequent so it's barely noticeable in
-            # practice.  If r never changes, this block is never entered.
+            # ── send only when target changed or keep-alive window elapsed ────
+            if xyz_key != last_xyz_key or (tick - last_send_time) >= KEEP_ALIVE_S:
+                try:
+                    self._set_cp_cmd(x, y, z, velocity, incremental=False)
+                    last_xyz_key = xyz_key
+                    last_send_time = tick
+                except DobotException as exc:
+                    self.logger.warning(f"RT CP cmd failed: {exc}")
+                    print(f"[RT] CP cmd failed: {exc}", flush=True)
+
+            # ── r correction via PTP (gated by deadband + time) ───────────────
             if (abs(r - last_r_sent) > R_DEADBAND_DEG
-                    and (tick - last_r_update_time) > R_MIN_INTERVAL_S):
+                    and (tick - last_r_time) > R_MIN_INTERVAL):
                 try:
                     self._set_ptp_cmd(x, y, z, r, MODE_PTP.MOVJ_XYZ, wait=False)
-                    last_r_sent        = r
-                    last_r_update_time = tick
+                    last_r_sent = r
+                    last_r_time = tick
                 except DobotException as exc:
-                    self.logger.warning(f"RT r PTP command failed: {exc}")
+                    self.logger.warning(f"RT r PTP failed: {exc}")
 
-            # ── sleep for the remainder of the period ─────────────────────
-            elapsed   = time.monotonic() - tick
+            # ── sleep for the rest of the period ──────────────────────────────
+            elapsed = time.monotonic() - tick
             remaining = self._rt_period - elapsed
             if remaining > 0:
                 time.sleep(remaining)
