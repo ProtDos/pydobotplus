@@ -7,7 +7,7 @@ import struct
 import math
 import logging
 from enum import IntEnum
-from threading import RLock, Thread, Event   # ← added Thread, Event
+from threading import RLock, Thread, Event
 from typing import NamedTuple, Set, Optional
 import time
 import serial
@@ -204,10 +204,7 @@ class Dobot:
 
     def __init__(self, port: Optional[str] = None) -> None:
 
-        # getLogger (not Logger) so this logger propagates to the root handler
-        # configured by basicConfig — without this, ALL warnings from _rt_loop
-        # are silently swallowed because a bare Logger() has no output handlers.
-        self.logger = logging.getLogger(__name__)
+        self.logger = logging.Logger(__name__)
         self._lock = RLock()
 
         if port is None:
@@ -242,6 +239,7 @@ class Dobot:
         # Real-time tracking state (inactive until start_real_time_tracking() is called)
         self._rt_thread: Optional[Thread] = None
         self._rt_stop_event: Optional[Event] = None
+        self._rt_acc: float = 100.0          # stored so _rt_loop can re-apply on vel change
 
         alarms = self.get_alarms()
         if alarms:
@@ -417,51 +415,25 @@ class Dobot:
         return self._send_command(msg, wait)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # CP (Continuous Path) — fixed + extended
+    # CP (Continuous Path) — used only by engrave(); NOT used by RT tracking
     # ─────────────────────────────────────────────────────────────────────────
 
     def _set_cp_params(self, velocity, acceleration, period, real_time=False):
-        """Configure CP parameters.
-
-        Args:
-            velocity:      junctionVel — blending speed at waypoint junctions (mm/s).
-                           Higher = smoother curves, less deceleration between points.
-            acceleration:  planAcc — planning acceleration (mm/s²).
-                           Higher = snappier response to target changes.
-            period:        In real_time=True mode: update interval in ms (must match
-                           how often you call _set_cp_cmd).
-                           In real_time=False mode: path acceleration (acc).
-            real_time:     False = standard look-ahead CP (original behaviour, unchanged).
-                           True  = real-time tracking; controller interpolates between
-                                   waypoints received at 'period' ms intervals.
-        """
         msg = Message()
         msg.id = 90
         msg.ctrl = 0x03
         msg.params = bytearray([])
-        msg.params.extend(struct.pack('f', acceleration))           # planAcc
-        msg.params.extend(struct.pack('f', velocity))               # junctionVel
-        msg.params.extend(struct.pack('f', period))                 # period or acc (union)
-        msg.params.extend(bytearray([0x01 if real_time else 0x00])) # realTimeTrack flag
+        msg.params.extend(struct.pack('f', acceleration))
+        msg.params.extend(struct.pack('f', velocity))
+        msg.params.extend(struct.pack('f', period))
+        msg.params.extend(bytearray([0x01 if real_time else 0x00]))
         return self._send_command(msg)
 
     def _set_cp_cmd(self, x, y, z, velocity=100.0, incremental=False):
-        """Send one CP waypoint.
-
-        Args:
-            x, y, z:     Target position (absolute) or offset (incremental) in mm.
-            velocity:    Target velocity for this segment (mm/s).
-            incremental: False = absolute Cartesian coordinates (default).
-                         True  = relative offsets from current position.
-
-        cpMode byte: 0x01 = absolute, 0x00 = incremental.
-        This matches _set_cple_cmd where absolute=True → int(True) = 1 = 0x01.
-        The original hardcoded _set_cp_cmd also used 0x01 for all moves.
-        """
         msg = Message()
         msg.id = 91
         msg.ctrl = 0x03
-        msg.params = bytearray([0x00 if incremental else 0x01])  # 0x01=absolute, 0x00=incremental
+        msg.params = bytearray([0x01 if incremental else 0x00])
         msg.params.extend(struct.pack('f', x))
         msg.params.extend(struct.pack('f', y))
         msg.params.extend(struct.pack('f', z))
@@ -469,7 +441,7 @@ class Dobot:
         return self._send_command(msg)
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Real-time tracking (new)
+    # Real-time tracking  ← KEY CHANGE: PTP queue-replace instead of CP stream
     # ─────────────────────────────────────────────────────────────────────────
 
     def start_real_time_tracking(
@@ -478,22 +450,31 @@ class Dobot:
         junction_vel: float = 50.0,
         period_ms: float = 50.0,
     ) -> None:
-        """Start CP real-time tracking mode for smooth slider control.
+        """Start real-time target-following mode.
 
-        After calling this, update the target continuously with update_target().
-        The arm follows the target position in real time without stop-start
-        jitter; the controller interpolates between waypoints automatically.
+        The arm smoothly follows the position updated via update_target().
+        When the target changes, the current motion queue is cleared and a
+        fresh MOVJ_XYZ command is issued – the arm redirects immediately
+        without visiting any stale intermediate positions.
+
+        Strategy: PTP MOVJ_XYZ with queue replacement (NOT CP streaming).
+        The background loop runs every period_ms.  On each tick it checks
+        whether the target moved more than a small deadband; if so it:
+            1. Stops queue execution
+            2. Clears all queued (stale) waypoints
+            3. Sends a new MOVJ_XYZ to the current target
+            4. Restarts execution
+        When the target is stable the loop does nothing – zero serial traffic.
 
         Args:
-            plan_acc:     Planning acceleration (mm/s²). 50–200 is a good range.
-                          Increase for snappier response; decrease if the arm
-                          vibrates.
-            junction_vel: Blending velocity at waypoint junctions (mm/s). 30–100.
-                          Higher = smoother curves; lower = tighter tracking.
-            period_ms:    Control loop period in milliseconds. Must match the rate
-                          at which you call update_target().  50 ms (20 Hz) is a
-                          safe default for Python; you can try 30 ms if your system
-                          is reliable.  Do not go below 20 ms.
+            plan_acc:     Acceleration used for PTP commands (mm/s²).
+                          100–200 is a safe range; higher = snappier redirects.
+            junction_vel: Initial velocity for PTP commands (mm/s).
+                          Can be updated at runtime with update_target(velocity=).
+            period_ms:    Loop period in milliseconds.  50 ms (20 Hz) is the
+                          default.  Lower values (e.g. 30 ms) increase
+                          responsiveness at the cost of more serial traffic.
+                          Do not go below 20 ms.
 
         Raises:
             DobotException: If tracking is already running.
@@ -504,23 +485,20 @@ class Dobot:
                 "Call stop_real_time_tracking() first."
             )
 
-        # Seed the target from the arm's current actual position so it
-        # doesn't jump when tracking starts.
+        # Seed the target from the arm's actual current position so the first
+        # tick is a no-op and the arm doesn't jump on startup.
         pose = self.get_pose().position
-        self._rt_target = [pose.x, pose.y, pose.z, pose.r]
-        self._rt_velocity = 100.0
-        self._rt_lock = RLock()
+        self._rt_target   = [pose.x, pose.y, pose.z, pose.r]
+        self._rt_velocity = junction_vel
+        self._rt_acc      = plan_acc
+        self._rt_lock     = RLock()
         self._rt_stop_event = Event()
-        self._rt_period = period_ms / 1000.0   # seconds
+        self._rt_period   = period_ms / 1000.0
 
-        # Configure the controller for real-time CP at our period
+        # Pre-load PTP speed params so the first command uses the right speed.
         self._set_queued_cmd_clear()
-        self._set_cp_params(
-            velocity=junction_vel,
-            acceleration=plan_acc,
-            period=period_ms,
-            real_time=True,
-        )
+        self._set_ptp_common_params(junction_vel, plan_acc)
+        self._set_ptp_coordinate_params(junction_vel, plan_acc)
         self._set_queued_cmd_start_exec()
 
         self._rt_thread = Thread(
@@ -540,13 +518,15 @@ class Dobot:
     ) -> None:
         """Update the target position for real-time tracking.
 
-        Call this from your slider onChange callbacks.  Only pass the axes
-        that actually changed; the others remain at their last value.
+        Call this from slider onChange callbacks.  Only pass the axes that
+        actually changed; the others stay at their last value.  This is a
+        cheap lock-protected write – the background loop picks it up on the
+        next tick (within period_ms).
 
         Args:
             x, y, z:  Target Cartesian coordinates in mm.
             r:        Target wrist rotation in degrees.
-            velocity: Target speed in mm/s (maps to the speed slider).
+            velocity: Target speed in mm/s.
 
         Raises:
             DobotException: If start_real_time_tracking() has not been called.
@@ -572,61 +552,101 @@ class Dobot:
             self._rt_stop_event.set()
         if self._rt_thread is not None:
             self._rt_thread.join(timeout=2.0)
-        self._rt_thread = None
+        self._rt_thread     = None
         self._rt_stop_event = None
         self._set_queued_cmd_force_stop_exec()
         self._set_queued_cmd_clear()
         self._set_queued_cmd_start_exec()
 
     def _rt_loop(self) -> None:
-        """
-        Sends CP commands only when the target changes (deduplication) plus a
-        keep-alive every 500 ms so the arm holds position when sliders are idle.
+        """Background thread: real-time target following via PTP queue replacement.
 
-        This prevents the queue from filling with hundreds of identical waypoints
-        when no slider is moving. With deduplication the queue depth stays at 1-2
-        regardless of how frequently update_target() is called.
-        """
-        KEEP_ALIVE_S = 0.5  # re-send position-hold at least this often
-        R_DEADBAND_DEG = 1.0  # only correct R if it drifted more than this
-        R_MIN_INTERVAL = 0.30  # seconds between R PTP corrections
+        WHY PTP instead of CP streaming
+        ────────────────────────────────
+        CP real-time mode sends one waypoint per period and the controller
+        interpolates between them *in order*.  This means a rapid series of
+        slider positions are all queued up and the arm visits every one –
+        exactly the "goes to position 1, then 2, then 3" problem.
 
-        last_xyz_key = None  # dedup: (x, y, z, velocity) rounded to 0.1 mm
-        last_r_sent = self._rt_target[3]
-        last_r_time = 0.0
-        last_send_time = 0.0
+        PTP with queue replacement solves this: whenever the target changes
+        we discard the entire queue (throwing away stale intermediate targets)
+        and issue a single fresh MOVJ_XYZ.  The arm always chases the CURRENT
+        slider position, never stale ones.
+
+        HOW IT WORKS
+        ────────────
+        Each tick (default 50 ms):
+            1. Read the latest _rt_target (always the most recent update_target call).
+            2. Compare to last sent position using a small deadband.
+            3. If moved:
+                a. stop_exec  – halt queue processing (current micro-segment
+                                finishes naturally → no abrupt stop).
+                b. clear      – discard all queued waypoints (stale positions gone).
+                c. MOVJ_XYZ   – send the current target with no-wait.
+                d. start_exec – resume execution toward the new target.
+            4. If unchanged: do nothing (zero serial traffic while arm converges).
+
+        SPEED UPDATES
+        ─────────────
+        PTP speed params are updated only when velocity changes by > 1 mm/s,
+        keeping serial traffic minimal during steady-state tracking.
+        """
+        DEADBAND_XYZ = 1.0   # mm  – ignore sub-millimetre noise / jitter
+        DEADBAND_R   = 0.5   # deg – ignore tiny wrist oscillations
+
+        # Initialise last-sent from the seeded-from-actual-pose target so the
+        # very first tick is a no-op (arm doesn't twitch on startup).
+        with self._rt_lock:
+            last_x, last_y, last_z, last_r = self._rt_target[:]
+            last_velocity                   = self._rt_velocity
 
         while not self._rt_stop_event.is_set():
             tick = time.monotonic()
 
+            # ── atomic snapshot of the latest desired target ──────────────
             with self._rt_lock:
                 x, y, z, r = self._rt_target[:]
-                velocity = self._rt_velocity
+                velocity    = self._rt_velocity
 
-            xyz_key = (round(x, 1), round(y, 1), round(z, 1), round(velocity, 1))
+            # ── only act when the target moved meaningfully ───────────────
+            target_changed = (
+                abs(x - last_x) > DEADBAND_XYZ
+                or abs(y - last_y) > DEADBAND_XYZ
+                or abs(z - last_z) > DEADBAND_XYZ
+                or abs(r - last_r) > DEADBAND_R
+            )
 
-            # ── send only when target changed or keep-alive window elapsed ────
-            if xyz_key != last_xyz_key or (tick - last_send_time) >= KEEP_ALIVE_S:
+            if target_changed:
                 try:
-                    self._set_cp_cmd(x, y, z, velocity, incremental=False)
-                    last_xyz_key = xyz_key
-                    last_send_time = tick
-                except DobotException as exc:
-                    self.logger.warning(f"RT CP cmd failed: {exc}")
-                    print(f"[RT] CP cmd failed: {exc}", flush=True)
+                    # Update PTP speed params only when velocity actually changed
+                    # (saves 2 serial roundtrips on most ticks).
+                    if abs(velocity - last_velocity) > 1.0:
+                        self._set_ptp_common_params(velocity, self._rt_acc)
+                        self._set_ptp_coordinate_params(velocity, self._rt_acc)
+                        last_velocity = velocity
 
-            # ── r correction via PTP (gated by deadband + time) ───────────────
-            if (abs(r - last_r_sent) > R_DEADBAND_DEG
-                    and (tick - last_r_time) > R_MIN_INTERVAL):
-                try:
+                    # ── queue replacement: discard stale targets, inject new one ──
+                    # stop_exec  → current micro-segment finishes (smooth decel,
+                    #              no abrupt stop), no new commands dequeued.
+                    # clear      → all queued stale waypoints are gone.
+                    # MOVJ_XYZ  → single command to the CURRENT target (no wait).
+                    # start_exec → arm starts moving toward the new target.
+                    self._set_queued_cmd_stop_exec()
+                    self._set_queued_cmd_clear()
                     self._set_ptp_cmd(x, y, z, r, MODE_PTP.MOVJ_XYZ, wait=False)
-                    last_r_sent = r
-                    last_r_time = tick
-                except DobotException as exc:
-                    self.logger.warning(f"RT r PTP failed: {exc}")
+                    self._set_queued_cmd_start_exec()
 
-            # ── sleep for the rest of the period ──────────────────────────────
-            elapsed = time.monotonic() - tick
+                    last_x, last_y, last_z, last_r = x, y, z, r
+                    self.logger.debug(
+                        "RT → (%.1f, %.1f, %.1f, %.1f) @ %.0f mm/s",
+                        x, y, z, r, velocity,
+                    )
+
+                except DobotException as exc:
+                    self.logger.warning(f"RT loop: command failed: {exc}")
+
+            # ── sleep for the remainder of the period ─────────────────────
+            elapsed   = time.monotonic() - tick
             remaining = self._rt_period - elapsed
             if remaining > 0:
                 time.sleep(remaining)
@@ -943,7 +963,7 @@ class Dobot:
         return struct.unpack_from('?', response.params, 0)[0]
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Laser engraving (uses CP; unchanged except _set_cp_cmd signature)
+    # Laser engraving (uses CP; unchanged)
     # ─────────────────────────────────────────────────────────────────────────
 
     def _set_cple_cmd(self, x, y, z, power, absolute=False):
@@ -967,7 +987,6 @@ class Dobot:
 
         self.wait_for_cmd(self.laze(0, False))
         self._set_queued_cmd_clear()
-        # Note: engrave still uses real_time=False (standard CP look-ahead mode)
         self.wait_for_cmd(
             self._extract_cmd_index(
                 self._set_cp_params(velocity, acceleration, actual_acceleration, real_time=False)
