@@ -362,6 +362,9 @@ class Dobot:
         self._send_command(msg)  # empty response
 
     def _set_cp_cmd(self, x, y, z):
+        # NOTE: This original method has a bug — it appends a single 0x00 byte
+        # instead of a 4-byte float for the velocity field required by CPCmd.
+        # Use _set_cp_cmd_rt() for correct CP real-time tracking behaviour.
         msg = Message()
         msg.id = 91
         msg.ctrl = 0x03
@@ -371,6 +374,113 @@ class Dobot:
         msg.params.extend(bytearray(struct.pack('f', z)))
         msg.params.append(0x00)
         return self._send_command(msg)
+
+    # ------------------------------------------------------------------ #
+    #  CP real-time tracking  (API section 2.15, realTimeTrack = 1)       #
+    # ------------------------------------------------------------------ #
+
+    def _set_cp_params_realtime(
+        self,
+        plan_acc: float = 100.0,
+        junction_vel: float = 50.0,
+        period: float = 200.0,
+    ) -> Message:
+        """Configure CPParams with realTimeTrack=1.
+
+        CPParams struct layout (from official API):
+            float planAcc       – planning acceleration (mm/s²)
+            float junctionVel   – velocity at segment junctions (mm/s)
+            float period        – ms between waypoints (used when realTimeTrack=1)
+            uint8_t realTimeTrack
+        """
+        msg = Message()
+        msg.id = 90
+        msg.ctrl = 0x03  # queued write
+        msg.params = bytearray()
+        msg.params.extend(struct.pack('f', plan_acc))
+        msg.params.extend(struct.pack('f', junction_vel))
+        msg.params.extend(struct.pack('f', period))
+        msg.params.extend(bytearray([0x01]))  # realTimeTrack = 1
+        return self._send_command(msg)
+
+    def _set_cp_cmd_rt(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        velocity: float = 100.0,
+        cp_mode: int = 1,
+    ) -> Message:
+        """Send a CPCmd with the correct 4-byte float velocity field.
+
+        CPCmd struct layout (from official API):
+            uint8_t cpMode   – 0 = relative, 1 = absolute
+            float   x
+            float   y
+            float   z
+            float   velocity – mm/s
+        """
+        msg = Message()
+        msg.id = 91
+        msg.ctrl = 0x03  # queued write
+        msg.params = bytearray([cp_mode])
+        msg.params.extend(struct.pack('f', x))
+        msg.params.extend(struct.pack('f', y))
+        msg.params.extend(struct.pack('f', z))
+        msg.params.extend(struct.pack('f', velocity))
+        return self._send_command(msg)
+
+    def setup_realtime_tracking(
+        self,
+        plan_acc: float = 100.0,
+        junction_vel: float = 50.0,
+        period: float = 200.0,
+    ) -> None:
+        """Flush the command queue and configure CP real-time tracking mode.
+
+        Call this once during initialisation and again after any stop/clear
+        cycle (e.g. to resync the R axis via PTP).
+
+        Args:
+            plan_acc:     Planning acceleration in mm/s² (default 100).
+            junction_vel: Velocity at waypoint junctions in mm/s (default 50).
+                          Lower = smoother direction changes; higher = faster.
+            period:       Expected interval between send_realtime_point() calls
+                          in milliseconds (default 200).  Must match the sleep
+                          period of the tracking thread.
+        """
+        self._set_queued_cmd_stop_exec()
+        self._set_queued_cmd_clear()
+        self._set_cp_params_realtime(plan_acc, junction_vel, period)
+        self._set_queued_cmd_start_exec()
+
+    def send_realtime_point(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        velocity: float = 100.0,
+    ) -> int:
+        """Queue a CP real-time absolute waypoint and return its queue index.
+
+        Call this at the rate matching the *period* passed to
+        setup_realtime_tracking().  The Dobot firmware chains consecutive CP
+        commands with look-ahead, so changing the target mid-flight results in
+        a smooth redirect rather than a stop-and-go.
+
+        Note: CP mode controls only X/Y/Z.  Use move_to() (PTP) when the R
+        (yaw) axis needs to change, then call setup_realtime_tracking() again
+        to re-enter CP mode.
+
+        Args:
+            x, y, z:  Absolute target in mm.
+            velocity: Travel speed in mm/s (clamped by firmware limits).
+        Returns:
+            Queue command index.
+        """
+        return self._extract_cmd_index(self._set_cp_cmd_rt(x, y, z, velocity, cp_mode=1))
+
+    # ------------------------------------------------------------------ #
 
     def _set_ptp_joint_params(self, v_x, v_y, v_z, v_r, a_x, a_y, a_z, a_r):
         msg = Message()
@@ -707,7 +817,8 @@ class Dobot:
         return self._send_command(msg)
 
     def _set_cp_params(self, velocity, acceleration, period):
-
+        # Original method kept for backwards-compatibility with engrave().
+        # Uses realTimeTrack=0 (non-real-time CP).
         msg = Message()
         msg.id = 90
         msg.ctrl = 0x3
@@ -715,7 +826,7 @@ class Dobot:
         msg.params.extend(bytearray(struct.pack('f', acceleration)))
         msg.params.extend(bytearray(struct.pack('f', velocity)))
         msg.params.extend(bytearray(struct.pack('f', period)))
-        msg.params.extend(bytearray([0x0]))  # non real-time mode (what does it mean??)
+        msg.params.extend(bytearray([0x0]))  # realTimeTrack = 0
         return self._send_command(msg)
 
     def _set_cple_cmd(self, x, y, z, power, absolute=False):
